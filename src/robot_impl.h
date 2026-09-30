@@ -3,6 +3,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <sstream>
 #include <type_traits>
@@ -18,6 +19,7 @@
 
 #include "logging/robot_state_logger.hpp"
 #include "network.h"
+#include "protocol/v5.h"
 #include "robot_control.h"
 #include "robot_model_base.h"
 #include "urdf_robot_type.h"
@@ -25,6 +27,8 @@
 namespace franka {
 
 RobotState convertRobotState(const research_interface::robot::RobotState& robot_state) noexcept;
+RobotState convertRobotState(
+    const protocol::v5::research_interface::robot::RobotState& robot_state) noexcept;
 
 /**
  * Implementation of the RobotControl interface.
@@ -37,10 +41,14 @@ class Robot::Impl : public RobotControl {
    * @param network the network connection to the robot
    * @param log_size the size of the log
    * @param realtime_config the realtime configuration
+   * @param reconnect opens a new connection to the same robot. When given and
+   *        the robot rejects the current protocol version with one this build
+   *        also speaks, the connection is reopened in that version.
    */
   explicit Impl(std::unique_ptr<Network> network,
                 size_t log_size,
-                RealtimeConfig realtime_config = RealtimeConfig::kEnforce);
+                RealtimeConfig realtime_config = RealtimeConfig::kEnforce,
+                std::function<std::unique_ptr<Network>()> reconnect = nullptr);
 
   // Inherited via RobotControl
   auto realtimeConfig() const noexcept -> RealtimeConfig override;
@@ -327,8 +335,11 @@ class Robot::Impl : public RobotControl {
   research_interface::robot::RobotCommand sendRobotCommand(
       const std::optional<research_interface::robot::MotionGeneratorCommand>& motion_command,
       const std::optional<research_interface::robot::ControllerCommand>& control_command) const;
-  research_interface::robot::RobotState receiveRobotState();
-  void updateState(const research_interface::robot::RobotState& robot_state);
+  RobotState receiveRobotState();
+  template <typename WireState>
+  RobotState receiveRobotStateAs();
+  template <typename WireState>
+  void updateState(const WireState& robot_state);
 
   std::unique_ptr<Network> network_;
   RobotStateLogger logger_;

@@ -26,7 +26,11 @@ Robot::Robot(const std::string& franka_address, RealtimeConfig realtime_config, 
     : impl_{new Robot::Impl(
           std::make_unique<Network>(franka_address, research_interface::robot::kCommandPort),
           log_size,
-          realtime_config)} {}
+          realtime_config,
+          [franka_address]() {
+            return std::make_unique<Network>(franka_address,
+                                             research_interface::robot::kCommandPort);
+          })} {}
 
 // Has to be declared here, as the Impl type is incomplete in the header.
 Robot::~Robot() noexcept = default;
@@ -186,6 +190,11 @@ RobotState Robot::readOnce() {
 }
 
 auto Robot::getRobotModel() -> std::string {
+  // Robots before protocol version 8 cannot send their description; the one this build uses
+  // for them is the answer.
+  if (impl_->serverVersion() < 8) {
+    return impl_->robotModelUrdf();
+  }
   auto get_robot_model =
       impl_->executeCommand<research_interface::robot::GetRobotModel, GetRobotModelResult>();
   return get_robot_model.robot_model_urdf;

@@ -148,6 +148,14 @@ target_include_directories(franka PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
+# Robot descriptions for protocol versions without GetRobotModel, compiled in.
+set(FRANKA_DESCRIPTIONS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/protocol/descriptions)
+file(READ ${FRANKA_DESCRIPTIONS_DIR}/fer.urdf FRANKA_FER_URDF)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FRANKA_DESCRIPTIONS_DIR}/fer.urdf)
+configure_file(src/protocol/robot_descriptions.h.in
+  ${CMAKE_CURRENT_BINARY_DIR}/generated/robot_descriptions.h @ONLY)
+target_include_directories(franka PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
 target_link_libraries(franka PRIVATE
   TinyXML2::TinyXML2
   Poco::Foundation

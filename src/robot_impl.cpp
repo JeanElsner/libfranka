@@ -8,6 +8,7 @@
 #include "franka/logging/logger.hpp"
 #include "franka/rate_limiting.h"
 #include "load_calculations.h"
+#include "robot_descriptions.h"
 
 namespace franka {
 
@@ -45,7 +46,10 @@ inline ControlException createControlException(const char* message,
 
 }  // anonymous namespace
 
-Robot::Impl::Impl(std::unique_ptr<Network> network, size_t log_size, RealtimeConfig realtime_config)
+Robot::Impl::Impl(std::unique_ptr<Network> network,
+                  size_t log_size,
+                  RealtimeConfig realtime_config,
+                  std::function<std::unique_ptr<Network>()> reconnect)
     : network_{std::move(network)}, logger_{log_size}, realtime_config_{realtime_config} {
   if (network_ == nullptr) {
     throw std::invalid_argument("libfranka robot: Invalid network argument");
@@ -65,13 +69,40 @@ Robot::Impl::Impl(std::unique_ptr<Network> network, size_t log_size, RealtimeCon
     throw RealtimeException("libfranka: Running kernel does not have realtime capabilities.");
   }
 
-  connect<research_interface::robot::Connect, research_interface::robot::kVersion>(*network_,
-                                                                                   &ri_version_);
-  updateState(network_->udpBlockingReceive<research_interface::robot::RobotState>());
+  // A robot that speaks another protocol version rejects the Connect and replies with its own
+  // version, in a message that is the same in every version. If this build also speaks that one,
+  // reconnect in it.
+  try {
+    connect<research_interface::robot::Connect, research_interface::robot::kVersion>(*network_,
+                                                                                     &ri_version_);
+  } catch (const IncompatibleVersionException& e) {
+    if (!reconnect || e.server_version != protocol::v5::research_interface::robot::kVersion) {
+      throw;
+    }
+    logging::logInfo("libfranka: Robot speaks protocol version {}, reconnecting in it.",
+                     e.server_version);
+    network_ = reconnect();
+    connect<protocol::v5::research_interface::robot::Connect,
+            protocol::v5::research_interface::robot::kVersion>(*network_, &ri_version_);
+  }
+  if (ri_version_ == protocol::v5::research_interface::robot::kVersion) {
+    updateState(
+        network_->udpBlockingReceive<protocol::v5::research_interface::robot::RobotState>());
+  } else {
+    updateState(network_->udpBlockingReceive<research_interface::robot::RobotState>());
+  }
 
-  auto get_robot_model =
-      this->executeCommand<research_interface::robot::GetRobotModel, GetRobotModelResult>();
-  robot_model_urdf_ = get_robot_model.robot_model_urdf;
+  // GetRobotModel only exists from protocol version 8. Older robots cannot send their
+  // description, so it comes with the build.
+  if (ri_version_ >= 8) {
+    auto get_robot_model =
+        this->executeCommand<research_interface::robot::GetRobotModel, GetRobotModelResult>();
+    robot_model_urdf_ = get_robot_model.robot_model_urdf;
+  } else if (ri_version_ <= protocol::v5::research_interface::robot::kVersion) {
+    robot_model_urdf_ = protocol::kFerUrdf;
+  } else {
+    throw IncompatibleVersionException(ri_version_, research_interface::robot::kVersion);
+  }
   is_mobile_robot_ = isMobileRobotUrdf(robot_model_urdf_);
 
   if (!is_mobile_robot_) {
@@ -87,7 +118,7 @@ RobotState Robot::Impl::updateMotion(
   research_interface::robot::RobotCommand robot_command =
       sendRobotCommand(motion_command, control_command);
 
-  RobotState state = convertRobotState(receiveRobotState());
+  RobotState state = receiveRobotState();
   logger_.log(state, robot_command);
 
   return state;
@@ -112,7 +143,7 @@ void Robot::Impl::throwOnMotionError(const RobotState& robot_state, uint32_t mot
 }
 
 RobotState Robot::Impl::readOnce() {
-  current_state_ = convertRobotState(receiveRobotState());
+  current_state_ = receiveRobotState();
   return current_state_;
 }
 
@@ -188,8 +219,9 @@ research_interface::robot::RobotCommand Robot::Impl::sendRobotCommand(
   return robot_command;
 }
 
-research_interface::robot::RobotState Robot::Impl::receiveRobotState() {
-  research_interface::robot::RobotState latest_accepted_state;
+template <typename WireState>
+RobotState Robot::Impl::receiveRobotStateAs() {
+  WireState latest_accepted_state{};
   auto last_message_id = 0U;
   {
     std::lock_guard<std::mutex> lock(message_id_mutex_);
@@ -198,7 +230,7 @@ research_interface::robot::RobotState Robot::Impl::receiveRobotState() {
   }
 
   // If states are already available on the socket, use the one with the most recent message ID.
-  research_interface::robot::RobotState received_state{};
+  WireState received_state{};
   while (network_->udpReceive(&received_state)) {
     if (received_state.message_id > latest_accepted_state.message_id) {
       latest_accepted_state = received_state;
@@ -214,18 +246,29 @@ research_interface::robot::RobotState Robot::Impl::receiveRobotState() {
   }
 
   updateState(latest_accepted_state);
-  return latest_accepted_state;
+  return convertRobotState(latest_accepted_state);
 }
 
-void Robot::Impl::updateState(const research_interface::robot::RobotState& robot_state) {
-  robot_mode_ = robot_state.robot_mode;
-  motion_generator_mode_ = robot_state.motion_generator_mode;
-  controller_mode_ = robot_state.controller_mode;
+template <typename WireState>
+void Robot::Impl::updateState(const WireState& robot_state) {
+  // Older protocols number these modes the same way; newer ones only append values.
+  robot_mode_ = static_cast<research_interface::robot::RobotMode>(robot_state.robot_mode);
+  motion_generator_mode_ = static_cast<research_interface::robot::MotionGeneratorMode>(
+      robot_state.motion_generator_mode);
+  controller_mode_ =
+      static_cast<research_interface::robot::ControllerMode>(robot_state.controller_mode);
 
   {
     std::lock_guard<std::mutex> lock(message_id_mutex_);
     message_id_ = robot_state.message_id;
   }
+}
+
+RobotState Robot::Impl::receiveRobotState() {
+  if (ri_version_ == protocol::v5::research_interface::robot::kVersion) {
+    return receiveRobotStateAs<protocol::v5::research_interface::robot::RobotState>();
+  }
+  return receiveRobotStateAs<research_interface::robot::RobotState>();
 }
 
 Robot::ServerVersion Robot::Impl::serverVersion() const noexcept {
@@ -478,9 +521,8 @@ void Robot::Impl::cancelMotion(uint32_t motion_id) {
     throw ControlException(e.what());
   }
 
-  research_interface::robot::RobotState robot_state;
   do {  // NOLINT(cppcoreguidelines-avoid-do-while)
-    robot_state = receiveRobotState();
+    receiveRobotState();
   } while (motionGeneratorRunning() || controllerRunning());
 
   // Ignore Move response.
@@ -499,7 +541,18 @@ Model Robot::Impl::loadModel(std::unique_ptr<RobotModelBase> robot_model) {
   return Model(std::move(robot_model));
 }
 
-RobotState convertRobotState(const research_interface::robot::RobotState& robot_state) noexcept {
+namespace {
+
+template <typename T, typename = void>
+struct HasAccelerometers : std::false_type {};
+template <typename T>
+struct HasAccelerometers<T, std::void_t<decltype(std::declval<T>().accelerometer_top)>>
+    : std::true_type {};
+
+// Every protocol version names the state fields the same way; they differ in which fields exist
+// and in whether poses and torques are sent as double or float.
+template <typename WireState>
+RobotState convertWireState(const WireState& robot_state) noexcept {
   RobotState converted;
   converted.O_T_EE = robot_state.O_T_EE;
   converted.O_T_EE_d = robot_state.O_T_EE_d;
@@ -546,15 +599,17 @@ RobotState convertRobotState(const research_interface::robot::RobotState& robot_
   converted.O_ddP_EE_c = robot_state.O_ddP_EE_c;
   converted.theta = robot_state.theta;
   converted.dtheta = robot_state.dtheta;
-  converted.accelerometer_top = robot_state.accelerometer_top;
-  converted.accelerometer_bottom = robot_state.accelerometer_bottom;
+  if constexpr (HasAccelerometers<WireState>::value) {
+    converted.accelerometer_top = robot_state.accelerometer_top;
+    converted.accelerometer_bottom = robot_state.accelerometer_bottom;
+  }
   converted.current_errors = robot_state.errors;
   converted.last_motion_errors = robot_state.reflex_reason;
   converted.control_command_success_rate = robot_state.control_command_success_rate;
   converted.time = Duration(robot_state.message_id);
 
   converted.robot_mode = RobotMode::kOther;
-  switch (robot_state.robot_mode) {
+  switch (static_cast<research_interface::robot::RobotMode>(robot_state.robot_mode)) {
     case research_interface::robot::RobotMode::kOther:
       converted.robot_mode = RobotMode::kOther;
       break;
@@ -579,6 +634,17 @@ RobotState convertRobotState(const research_interface::robot::RobotState& robot_
   }
 
   return converted;
+}
+
+}  // anonymous namespace
+
+RobotState convertRobotState(const research_interface::robot::RobotState& robot_state) noexcept {
+  return convertWireState(robot_state);
+}
+
+RobotState convertRobotState(
+    const protocol::v5::research_interface::robot::RobotState& robot_state) noexcept {
+  return convertWireState(robot_state);
 }
 
 template void Robot::Impl::writeOnce<JointPositions>(const JointPositions& motion_generator_input);
