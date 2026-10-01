@@ -91,6 +91,10 @@ class Robot:
         self.nonzero_dq = 0
         self.last_tau = None
         self.dq_history = []
+        self.move_started = None
+        self.mode_override = None
+        self.last_command_time = None
+        self.longest_gap = 0.0
         # What the robot reports back as desired, which libfranka's rate limiting and filter
         # start from: the last command, and zero while idle.
         self.q_d = list(Q)
@@ -100,6 +104,10 @@ class Robot:
 
 
 STILL = False  # --still: a robot at rest, for clients that check physical plausibility
+STOP_STREAMING_AFTER = None  # --stop-streaming-after: go silent this long into a Move
+REFLEX_AFTER = None  # --reflex-after: abort the Move with a reflex this long into it
+IGNORE_FINISH = False  # --ignore-finish: keep a Move running when the client finishes it
+K_REFLEX_ABORTED = 6  # v5 Move::Status
 
 
 def state_values(message_id, robot):
@@ -121,7 +129,7 @@ def state_values(message_id, robot):
         I_load=[0.0] * 9,
         motion_generator_mode=robot.motion_generator_mode,
         controller_mode=robot.controller_mode,
-        robot_mode=2 if robot.move is not None else 1,  # kMove while a Move runs, else kIdle
+        robot_mode=robot.mode_override or (2 if robot.move is not None else 1),  # kMove, kIdle
         control_command_success_rate=0.75 + 1e-10,
     )
     values["errors"][7] = True  # one error set, to check the error mapping
@@ -152,7 +160,17 @@ def stream(address, stop, robot):
     message_id = 1
     while not stop.is_set():
         with robot.lock:
-            udp.sendto(state_values(message_id, robot), address)
+            if (REFLEX_AFTER is not None and robot.move is not None
+                    and time.monotonic() - robot.move_started > REFLEX_AFTER):
+                conn, command_id = robot.move
+                robot.motion_generator_mode, robot.controller_mode = 0, 3
+                robot.move, robot.mode_override = None, 4  # kReflex
+                reply(conn, 1, command_id, K_REFLEX_ABORTED)
+                print(f"move {command_id} aborted by a reflex", flush=True)
+            silent = (STOP_STREAMING_AFTER is not None and robot.move_started is not None
+                      and time.monotonic() - robot.move_started > STOP_STREAMING_AFTER)
+            if not silent:
+                udp.sendto(state_values(message_id, robot), address)
         message_id += 1
         time.sleep(0.001)
         while True:
@@ -162,6 +180,10 @@ def stream(address, stop, robot):
                 break
             with robot.lock:
                 robot.commands += 1
+                now = time.monotonic()
+                if robot.last_command_time is not None:
+                    robot.longest_gap = max(robot.longest_gap, now - robot.last_command_time)
+                robot.last_command_time = now
                 if len(data) != ROBOT_COMMAND.size:
                     robot.wrong_sizes += 1
                     continue
@@ -172,12 +194,14 @@ def stream(address, stop, robot):
                 robot.ddq_d = [(new - old) / 0.001 for new, old in zip(dq_c, robot.dq_d)]
                 robot.dq_d, robot.tau_J_d = list(dq_c), list(tau)
                 robot.dq_history.append(dq_c)
-                if finished and robot.move is not None:
+                if finished and robot.move is not None and not IGNORE_FINISH:
                     conn, command_id = robot.move
                     robot.motion_generator_mode, robot.controller_mode = 0, 3
                     robot.move = None
                     robot.dq_d, robot.ddq_d = [0.0] * 7, [0.0] * 7
                     reply(conn, 1, command_id, K_SUCCESS)
+                    print(f"  longest gap between 1 kHz commands {robot.longest_gap * 1000:.1f} ms",
+                          flush=True)
                     print(f"move {command_id} finished after {robot.commands} 1 kHz commands, "
                           f"{robot.wrong_sizes} of the wrong size, {robot.nonzero_dq} with nonzero"
                           f" dq_c, last tau_J_d {[round(t, 3) for t in tau]}", flush=True)
@@ -201,6 +225,8 @@ def handle_command(conn, command, command_id, body, robot):
             robot.move = (conn, command_id)
             robot.commands = robot.wrong_sizes = robot.nonzero_dq = 0
             robot.dq_history = []
+            robot.move_started = time.monotonic()
+            robot.last_command_time, robot.longest_gap = None, 0.0
         print(f"  controller mode {controller}, motion generator mode {generator}", flush=True)
         reply(conn, command, command_id, K_MOTION_STARTED)
     elif name == "StopMove":
@@ -280,6 +306,15 @@ if __name__ == "__main__":
     parser.add_argument("--version", type=int, default=5)
     parser.add_argument("--seconds", type=float, default=30)
     parser.add_argument("--still", action="store_true", help="report a robot at rest")
+    parser.add_argument("--stop-streaming-after", type=float,
+                        help="stop sending state this many seconds into a Move")
+    parser.add_argument("--reflex-after", type=float,
+                        help="abort a Move with a reflex this many seconds into it")
+    parser.add_argument("--ignore-finish", action="store_true",
+                        help="keep a Move running when the client finishes it")
     args = parser.parse_args()
     STILL = args.still
+    REFLEX_AFTER = args.reflex_after
+    IGNORE_FINISH = args.ignore_finish
+    STOP_STREAMING_AFTER = args.stop_streaming_after
     serve(args.port, args.version, args.seconds)
