@@ -1,13 +1,18 @@
 """A fake control unit that speaks research interface protocol version 5.
 
 It behaves like a Franka Emika Robot on system 4.2.1 or later, as far as
-connecting and streaming state go:
+connecting, streaming state and taking commands go:
 
   - A Connect offering any other version is rejected with status
     kIncompatibleLibraryVersion and version 5, and the connection closed. That
     is what a real FER was observed to do.
   - A Connect offering version 5 is accepted, and the robot state is then
     streamed over UDP at 1 kHz to the port the client named.
+  - TCP commands are answered with kSuccess, and logged with their v5 command
+    number and size. A Move switches the streamed modes to the requested ones
+    and answers kMotionStarted; when a 1 kHz command reports the motion
+    finished, the modes return to idle and the Move is answered kSuccess.
+  - 1 kHz commands are checked to be v5 sized (370 bytes) and logged.
 
 Every field of the state carries a distinct value with a marker in its tenth
 decimal, so a client that routes the state through the float-based current
@@ -49,6 +54,18 @@ HEADER = struct.Struct("<III")  # command, command id, size
 CONNECT_REQUEST = struct.Struct("<HH")  # version, udp port
 CONNECT_RESPONSE = struct.Struct("<BH")  # status, version
 K_CONNECT, K_SUCCESS, K_INCOMPATIBLE = 0, 0, 1
+K_MOTION_STARTED = 1
+# v5 command numbers, from its Command enum.
+V5_COMMANDS = ["Connect", "Move", "StopMove", "GetCartesianLimit", "SetCollisionBehavior",
+               "SetJointImpedance", "SetCartesianImpedance", "SetGuidingMode", "SetEEToK",
+               "SetNEToEE", "SetLoad", "SetFilters", "AutomaticErrorRecovery",
+               "LoadModelLibrary"]
+MOVE_REQUEST = struct.Struct("<II3d3d")  # controller mode, motion generator mode, deviations
+STATUS_RESPONSE = struct.Struct("<B")
+# RobotCommand: message_id, MotionGeneratorCommand (q_c, dq_c, O_T_EE_c, O_dP_EE_c, elbow_c,
+# valid_elbow, motion_generation_finished), ControllerCommand (tau_J_d).
+ROBOT_COMMAND = struct.Struct("<Q7d7d16d6d2d??7d")
+assert ROBOT_COMMAND.size == 370
 
 # A recorded FER configuration, and Franka's gravity for it with no payload.
 Q = [0.7936381933528991, -0.8116399619540988, -2.6598748181993264, -3.022184038143356,
@@ -61,7 +78,26 @@ def marker(field_index, element):
     return field_index + element / 100 + (field_index + 1) * 1e-10
 
 
-def state_values(message_id):
+class Robot:
+    """What the fake reports, shared between the TCP and UDP threads."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.motion_generator_mode = 0  # kIdle
+        self.controller_mode = 3  # kOther
+        self.move = None  # (connection, command id) of the running Move
+        self.commands = 0
+        self.wrong_sizes = 0
+        self.nonzero_dq = 0
+        self.last_tau = None
+        # What the robot reports back as desired, which libfranka's rate limiting and filter
+        # start from: the last command, and zero while idle.
+        self.q_d = list(Q)
+        self.dq_d = [0.0] * 7
+        self.tau_J_d = [0.0] * 7
+
+
+def state_values(message_id, robot):
     values = {}
     for index, (name, code, count) in enumerate(LAYOUT_V5):
         if code == "d":
@@ -75,11 +111,12 @@ def state_values(message_id):
         F_T_EE=list(IDENTITY), EE_T_K=list(IDENTITY), F_T_NE=list(IDENTITY),
         NE_T_EE=list(IDENTITY),
         O_ddP_O=[0.0, 0.0, -9.81],  # the gravity vector, as robots report it
+        q_d=list(robot.q_d), dq_d=list(robot.dq_d), ddq_d=[0.0] * 7, tau_J_d=list(robot.tau_J_d),
         m_ee=0.0, m_load=0.0, F_x_Cee=[0.0] * 3, F_x_Cload=[0.0] * 3, I_ee=[0.0] * 9,
         I_load=[0.0] * 9,
-        motion_generator_mode=0,  # kIdle
-        controller_mode=3,  # kOther
-        robot_mode=1,  # kIdle
+        motion_generator_mode=robot.motion_generator_mode,
+        controller_mode=robot.controller_mode,
+        robot_mode=2 if robot.move is not None else 1,  # kMove while a Move runs, else kIdle
         control_command_success_rate=0.75 + 1e-10,
     )
     values["errors"][7] = True  # one error set, to check the error mapping
@@ -90,13 +127,67 @@ def state_values(message_id):
     return struct.pack(STATE_FORMAT, *flat)
 
 
-def stream(address, stop):
+def reply(conn, command, command_id, status, body=b""):
+    payload = STATUS_RESPONSE.pack(status) + body
+    conn.sendall(HEADER.pack(command, command_id, HEADER.size + len(payload)) + payload)
+
+
+def stream(address, stop, robot):
+    """Send state at 1 kHz and take the 1 kHz commands that come back on the same socket."""
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.setblocking(False)
     message_id = 1
     while not stop.is_set():
-        udp.sendto(state_values(message_id), address)
+        with robot.lock:
+            udp.sendto(state_values(message_id, robot), address)
         message_id += 1
         time.sleep(0.001)
+        while True:
+            try:
+                data = udp.recv(4096)
+            except BlockingIOError:
+                break
+            with robot.lock:
+                robot.commands += 1
+                if len(data) != ROBOT_COMMAND.size:
+                    robot.wrong_sizes += 1
+                    continue
+                fields = ROBOT_COMMAND.unpack(data)
+                dq_c, finished, tau = fields[8:15], fields[40], fields[41:48]
+                robot.nonzero_dq += any(v != 0 for v in dq_c)
+                robot.last_tau = tau
+                robot.dq_d, robot.tau_J_d = list(dq_c), list(tau)
+                if finished and robot.move is not None:
+                    conn, command_id = robot.move
+                    robot.motion_generator_mode, robot.controller_mode = 0, 3
+                    robot.move = None
+                    reply(conn, 1, command_id, K_SUCCESS)
+                    print(f"move {command_id} finished after {robot.commands} 1 kHz commands, "
+                          f"{robot.wrong_sizes} of the wrong size, {robot.nonzero_dq} with nonzero"
+                          f" dq_c, last tau_J_d {[round(t, 3) for t in tau]}", flush=True)
+
+
+def handle_command(conn, command, command_id, body, robot):
+    name = V5_COMMANDS[command] if command < len(V5_COMMANDS) else f"#{command}"
+    print(f"command {command} {name}, {HEADER.size + len(body)} bytes", flush=True)
+    if name == "Move":
+        controller, generator, *_ = MOVE_REQUEST.unpack(body)
+        with robot.lock:
+            # Move numbers its modes without kIdle; the state's MotionGeneratorMode starts with it.
+            robot.motion_generator_mode, robot.controller_mode = generator + 1, controller
+            robot.move = (conn, command_id)
+            robot.commands = robot.wrong_sizes = robot.nonzero_dq = 0
+        print(f"  controller mode {controller}, motion generator mode {generator}", flush=True)
+        reply(conn, command, command_id, K_MOTION_STARTED)
+    elif name == "StopMove":
+        with robot.lock:
+            robot.motion_generator_mode, robot.controller_mode = 0, 3
+            move, robot.move = robot.move, None
+        reply(conn, command, command_id, K_SUCCESS)
+        if move is not None:
+            reply(move[0], 1, move[1], 2)  # kPreempted
+    else:
+        reply(conn, command, command_id, K_SUCCESS)
 
 
 def recv_exactly(conn, size):
@@ -117,6 +208,7 @@ def serve(port, version, seconds):
     server.settimeout(seconds)
     print("ready", flush=True)
     stop = threading.Event()
+    robot = Robot()
     end = time.monotonic() + seconds
     try:
         while time.monotonic() < end:
@@ -138,13 +230,17 @@ def serve(port, version, seconds):
             if not accepted:
                 conn.close()
                 continue
-            threading.Thread(target=stream, args=((peer[0], udp_port), stop), daemon=True).start()
-            # Hold the session open until the client leaves or time runs out.
+            threading.Thread(
+                target=stream, args=((peer[0], udp_port), stop, robot), daemon=True
+            ).start()
+            # Serve commands until the client leaves or time runs out.
             conn.settimeout(max(0.1, end - time.monotonic()))
             try:
-                while conn.recv(4096):
-                    pass
-            except (socket.timeout, OSError):
+                while True:
+                    command, command_id, size = HEADER.unpack(recv_exactly(conn, HEADER.size))
+                    handle_command(conn, command, command_id,
+                                   recv_exactly(conn, size - HEADER.size), robot)
+            except (socket.timeout, OSError, ConnectionError):
                 pass
             stop.set()
             conn.close()

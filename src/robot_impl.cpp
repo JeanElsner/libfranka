@@ -130,8 +130,7 @@ void Robot::Impl::throwOnMotionError(const RobotState& robot_state, uint32_t mot
       controller_mode_ != current_move_controller_mode_) {
     // We detect a move error by changes in the robot state and we will receive a TCP response to
     // the Move command.
-    auto response =
-        network_->tcpBlockingReceiveResponse<research_interface::robot::Move>(motion_id);
+    auto response = receiveMoveResponse(motion_id);
     try {
       handleCommandResponse<research_interface::robot::Move>(response);
     } catch (const CommandException& e) {
@@ -214,7 +213,13 @@ research_interface::robot::RobotCommand Robot::Impl::sendRobotCommand(
     throw ControlException("libfranka robot: Trying to send partial robot command!");
   }
 
-  network_->udpSend<research_interface::robot::RobotCommand>(robot_command);
+  if (ri_version_ == protocol::v5::wire::kVersion) {
+    network_->udpSend(protocol::v5::robotCommand(
+        robot_command, current_move_motion_generator_mode_ ==
+                           research_interface::robot::MotionGeneratorMode::kNone));
+  } else {
+    network_->udpSend<research_interface::robot::RobotCommand>(robot_command);
+  }
 
   return robot_command;
 }
@@ -257,11 +262,40 @@ void Robot::Impl::updateState(const WireState& robot_state) {
       robot_state.motion_generator_mode);
   controller_mode_ =
       static_cast<research_interface::robot::ControllerMode>(robot_state.controller_mode);
+  // v5 runs pure torque control as a joint velocity motion that commands zero; to the rest of
+  // libfranka it is the motion without a generator it started.
+  if constexpr (std::is_same_v<WireState, protocol::v5::wire::RobotState>) {
+    if (current_move_motion_generator_mode_ ==
+            research_interface::robot::MotionGeneratorMode::kNone &&
+        motion_generator_mode_ == research_interface::robot::MotionGeneratorMode::kJointVelocity) {
+      motion_generator_mode_ = research_interface::robot::MotionGeneratorMode::kNone;
+    }
+  }
 
   {
     std::lock_guard<std::mutex> lock(message_id_mutex_);
     message_id_ = robot_state.message_id;
   }
+}
+
+research_interface::robot::Move::Response Robot::Impl::receiveMoveResponse(uint32_t motion_id) {
+  if (ri_version_ == protocol::v5::wire::kVersion) {
+    return protocol::v5::translateResponse<research_interface::robot::Move>(
+        network_->tcpBlockingReceiveResponse<protocol::v5::wire::Move>(motion_id));
+  }
+  return network_->tcpBlockingReceiveResponse<research_interface::robot::Move>(motion_id);
+}
+
+bool Robot::Impl::tryReceiveMoveResponse(
+    uint32_t motion_id,
+    const std::function<void(const research_interface::robot::Move::Response&)>& handler) {
+  if (ri_version_ == protocol::v5::wire::kVersion) {
+    return network_->tcpReceiveResponse<protocol::v5::wire::Move>(
+        motion_id, [&handler](const protocol::v5::wire::Move::Response& response) {
+          handler(protocol::v5::translateResponse<research_interface::robot::Move>(response));
+        });
+  }
+  return network_->tcpReceiveResponse<research_interface::robot::Move>(motion_id, handler);
 }
 
 RobotState Robot::Impl::receiveRobotState() {
@@ -364,8 +398,8 @@ uint32_t Robot::Impl::startMotion(
   while (motion_generator_mode_ != current_move_motion_generator_mode_ ||
          controller_mode_ != current_move_controller_mode_) {
     try {
-      if (network_->tcpReceiveResponse<research_interface::robot::Move>(
-              move_command_id, [this](const auto& response) {
+      if (tryReceiveMoveResponse(
+              move_command_id, [this](const research_interface::robot::Move::Response& response) {
                 return this->handleCommandResponse<research_interface::robot::Move>(response);
               })) {
         break;
@@ -411,7 +445,7 @@ void Robot::Impl::finishMotion(
     robot_state = updateMotion(motion_finished_command, controller_finished_command);
   }
 
-  auto response = network_->tcpBlockingReceiveResponse<research_interface::robot::Move>(motion_id);
+  auto response = receiveMoveResponse(motion_id);
   if (response.status == research_interface::robot::Move::Status::kReflexAborted) {
     throw createControlException("Motion finished commanded, but the robot is still moving!",
                                  response.status, robot_state.last_motion_errors, logger_.flush());
@@ -527,7 +561,7 @@ void Robot::Impl::cancelMotion(uint32_t motion_id) {
 
   // Ignore Move response.
   // TODO (FWA): It is not guaranteed that the Move response won't come later
-  network_->tcpReceiveResponse<research_interface::robot::Move>(motion_id, [](auto) {});
+  tryReceiveMoveResponse(motion_id, [](const research_interface::robot::Move::Response&) {});
   current_move_motion_generator_mode_ = research_interface::robot::MotionGeneratorMode::kIdle;
   current_move_controller_mode_ = research_interface::robot::ControllerMode::kOther;
 }

@@ -20,6 +20,7 @@
 #include "logging/robot_state_logger.hpp"
 #include "network.h"
 #include "protocol/v5.h"
+#include "protocol/v5_commands.h"
 #include "robot_control.h"
 #include "robot_model_base.h"
 #include "urdf_robot_type.h"
@@ -336,6 +337,10 @@ class Robot::Impl : public RobotControl {
       const std::optional<research_interface::robot::MotionGeneratorCommand>& motion_command,
       const std::optional<research_interface::robot::ControllerCommand>& control_command) const;
   RobotState receiveRobotState();
+  research_interface::robot::Move::Response receiveMoveResponse(uint32_t motion_id);
+  bool tryReceiveMoveResponse(
+      uint32_t motion_id,
+      const std::function<void(const research_interface::robot::Move::Response&)>& handler);
   template <typename WireState>
   RobotState receiveRobotStateAs();
   template <typename WireState>
@@ -557,6 +562,15 @@ inline void Robot::Impl::handleCommandResponse<research_interface::robot::Automa
 
 template <typename T, typename ReturnType, typename... TArgs>
 ReturnType Robot::Impl::executeCommand(TArgs... args) {
+  if constexpr (protocol::v5::HasCounterpart<T>::value) {
+    if (ri_version_ == protocol::v5::wire::kVersion) {
+      using T5 = typename protocol::v5::Counterpart<T>::type;
+      uint32_t command_id = network_->tcpSendRequest<T5>(protocol::v5::request<T>(args...));
+      handleCommandResponse<T>(
+          protocol::v5::translateResponse<T>(network_->tcpBlockingReceiveResponse<T5>(command_id)));
+      return command_id;
+    }
+  }
   uint32_t command_id = network_->tcpSendRequest<T>(args...);
   typename T::Response response = network_->tcpBlockingReceiveResponse<T>(command_id);
   handleCommandResponse<T>(response);
