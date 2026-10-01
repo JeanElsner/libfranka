@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
   print("dtheta", state.dtheta);
   print("upper_velocity_limits", robot.getUpperJointVelocityLimits(state.q));
   print("lower_velocity_limits", robot.getLowerJointVelocityLimits(state.q));
+  // gravity(state) takes the gravity vector from O_ddP_O; this one assumes a floor mounted robot.
+  print("gravity_floor_mounted", model.gravity(state, {{0.0, 0.0, -9.81}}));
   print("gravity", model.gravity(state), true);
   std::cout << "}\n";
   return 0;

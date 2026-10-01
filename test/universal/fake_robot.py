@@ -99,6 +99,9 @@ class Robot:
         self.tau_J_d = [0.0] * 7
 
 
+STILL = False  # --still: a robot at rest, for clients that check physical plausibility
+
+
 def state_values(message_id, robot):
     values = {}
     for index, (name, code, count) in enumerate(LAYOUT_V5):
@@ -122,6 +125,14 @@ def state_values(message_id, robot):
         control_command_success_rate=0.75 + 1e-10,
     )
     values["errors"][7] = True  # one error set, to check the error mapping
+    if STILL:
+        for name in ("dq", "dtheta", "dtau_J", "O_dP_EE_d", "O_dP_EE_c", "O_ddP_EE_c",
+                     "tau_ext_hat_filtered", "O_F_ext_hat_K", "K_F_ext_hat_K", "joint_contact",
+                     "cartesian_contact", "joint_collision", "cartesian_collision", "elbow_c",
+                     "delbow_c", "ddelbow_c"):
+            values[name] = [0.0] * len(values[name])
+        values.update(theta=list(Q), O_T_EE=list(IDENTITY), O_T_EE_d=list(IDENTITY),
+                      O_T_EE_c=list(IDENTITY), errors=[False] * 41)
     flat = []
     for name, code, count in LAYOUT_V5:
         value = values[name]
@@ -268,5 +279,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=1337)
     parser.add_argument("--version", type=int, default=5)
     parser.add_argument("--seconds", type=float, default=30)
+    parser.add_argument("--still", action="store_true", help="report a robot at rest")
     args = parser.parse_args()
+    STILL = args.still
     serve(args.port, args.version, args.seconds)
