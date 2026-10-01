@@ -49,6 +49,16 @@ int main(int argc, char** argv) {
       return ++ticks >= 50 ? franka::MotionFinished(zero) : zero;
     });
     std::cout << "joint velocity motion: " << ticks << " ticks\n";
+
+    // A step to 0.5 rad/s, which the rate limiter turns into a ramp at the robot's limits.
+    ticks = 0;
+    robot.control(
+        [&ticks](const franka::RobotState&, franka::Duration) -> franka::JointVelocities {
+          franka::JointVelocities step(std::array<double, 7>{0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5});
+          return ++ticks >= 200 ? franka::MotionFinished(step) : step;
+        },
+        franka::ControllerMode::kJointImpedance, /*limit_rate=*/true);
+    std::cout << "rate limited joint velocity step: " << ticks << " ticks\n";
   } catch (const franka::Exception& e) {
     std::cerr << "failed: " << e.what() << '\n';
     return 1;

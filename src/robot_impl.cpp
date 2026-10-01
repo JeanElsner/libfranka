@@ -331,13 +331,28 @@ RealtimeConfig Robot::Impl::realtimeConfig() const noexcept {
 }
 
 std::array<double, RobotControl::kNumJoints> Robot::Impl::getUpperJointVelocityLimits(
-    const std::array<double, RobotControl::kNumJoints>& joint_positions) const {
-  return joint_velocity_limits_config_.getUpperJointVelocityLimits(joint_positions);
+    const std::array<double, kNumJoints>& joint_positions) const {
+  auto limits = joint_velocity_limits_config_.getUpperJointVelocityLimits(joint_positions);
+  // The configuration subtracts the current protocol's tolerance; apply the robot's instead.
+  for (size_t i = 0; i < limits.size(); i++) {
+    limits[i] += kJointVelocityLimitsTolerance[i] - rateLimits().joint_velocity_tolerance[i];
+  }
+  return limits;
 }
 
 std::array<double, RobotControl::kNumJoints> Robot::Impl::getLowerJointVelocityLimits(
-    const std::array<double, RobotControl::kNumJoints>& joint_positions) const {
-  return joint_velocity_limits_config_.getLowerJointVelocityLimits(joint_positions);
+    const std::array<double, kNumJoints>& joint_positions) const {
+  auto limits = joint_velocity_limits_config_.getLowerJointVelocityLimits(joint_positions);
+  for (size_t i = 0; i < limits.size(); i++) {
+    limits[i] -= kJointVelocityLimitsTolerance[i] - rateLimits().joint_velocity_tolerance[i];
+  }
+  return limits;
+}
+
+auto Robot::Impl::rateLimits() const noexcept -> const protocol::RateLimits& {
+  // Protocol versions up to 5 are spoken only by the Franka Emika Robot.
+  return ri_version_ <= protocol::v5::wire::kVersion ? protocol::kFerRateLimits
+                                                     : protocol::kFr3RateLimits;
 }
 
 uint32_t Robot::Impl::startMotion(

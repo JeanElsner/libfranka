@@ -146,7 +146,8 @@ auto ControlLoop<MotionControlType>::loop() -> void try {
   } catch (const std::exception& e) {
     // The original control-loop exception below is the meaningful one and is always rethrown; log
     // the secondary cancel failure so it stays visible instead of silently swallowed.
-    logging::logError("libfranka: failed to cancel motion after a control-loop error: {}", e.what());
+    logging::logError("libfranka: failed to cancel motion after a control-loop error: {}",
+                      e.what());
   } catch (...) {
   }
   throw;
@@ -210,10 +211,11 @@ void ControlLoop<JointPositions>::convertMotion(
     }
   }
   if (limit_rate_) {
-    command.q_c = limitRate(robot_.getUpperJointVelocityLimits(reference_position),
-                            robot_.getLowerJointVelocityLimits(reference_position),
-                            kMaxJointAcceleration, kMaxJointJerk, command.q_c, reference_position,
-                            robot_state.dq_d, robot_state.ddq_d);
+    command.q_c =
+        limitRate(robot_.getUpperJointVelocityLimits(reference_position),
+                  robot_.getLowerJointVelocityLimits(reference_position),
+                  robot_.rateLimits().max_joint_acceleration, robot_.rateLimits().max_joint_jerk,
+                  command.q_c, reference_position, robot_state.dq_d, robot_state.ddq_d);
   }
   checkFinite(command.q_c);
 }
@@ -233,8 +235,9 @@ void ControlLoop<JointVelocities>::convertMotion(
   if (limit_rate_) {
     command.dq_c =
         limitRate(robot_.getUpperJointVelocityLimits(robot_state.q_d),
-                  robot_.getLowerJointVelocityLimits(robot_state.q_d), kMaxJointAcceleration,
-                  kMaxJointJerk, command.dq_c, robot_state.dq_d, robot_state.ddq_d);
+                  robot_.getLowerJointVelocityLimits(robot_state.q_d),
+                  robot_.rateLimits().max_joint_acceleration, robot_.rateLimits().max_joint_jerk,
+                  command.dq_c, robot_state.dq_d, robot_state.ddq_d);
   }
   checkFinite(command.dq_c);
 }
@@ -266,9 +269,11 @@ void ControlLoop<CartesianPose>::convertMotion(
   }
   if (limit_rate_) {
     command.O_T_EE_c = limitRate(
-        kMaxTranslationalVelocity, kMaxTranslationalAcceleration, kMaxTranslationalJerk,
-        kMaxRotationalVelocity, kMaxRotationalAcceleration, kMaxRotationalJerk, command.O_T_EE_c,
-        reference_cartesian_pose, robot_state.O_dP_EE_c, robot_state.O_ddP_EE_c);
+        robot_.rateLimits().max_translational_velocity,
+        robot_.rateLimits().max_translational_acceleration,
+        robot_.rateLimits().max_translational_jerk, robot_.rateLimits().max_rotational_velocity,
+        robot_.rateLimits().max_rotational_acceleration, robot_.rateLimits().max_rotational_jerk,
+        command.O_T_EE_c, reference_cartesian_pose, robot_state.O_dP_EE_c, robot_state.O_ddP_EE_c);
   }
   checkMatrix(command.O_T_EE_c);
 
@@ -280,9 +285,11 @@ void ControlLoop<CartesianPose>::convertMotion(
           lowpassFilter(kDeltaT, command.elbow_c[0], reference_elbow_pose[0], cutoff_frequency_);
     }
     if (limit_rate_) {
-      command.elbow_c[0] = limitRate(kMaxElbowVelocity, kMinElbowVelocity, kMaxElbowAcceleration,
-                                     kMaxElbowJerk, command.elbow_c[0], reference_elbow_pose[0],
-                                     robot_state.delbow_c[0], robot_state.ddelbow_c[0]);
+      command.elbow_c[0] =
+          limitRate(robot_.rateLimits().max_elbow_velocity, robot_.rateLimits().min_elbow_velocity,
+                    robot_.rateLimits().max_elbow_acceleration, robot_.rateLimits().max_elbow_jerk,
+                    command.elbow_c[0], reference_elbow_pose[0], robot_state.delbow_c[0],
+                    robot_state.ddelbow_c[0]);
     }
     checkElbow(command.elbow_c);
   } else {
@@ -304,10 +311,12 @@ void ControlLoop<CartesianVelocities>::convertMotion(
     }
   }
   if (limit_rate_) {
-    command.O_dP_EE_c =
-        limitRate(kMaxTranslationalVelocity, kMaxTranslationalAcceleration, kMaxTranslationalJerk,
-                  kMaxRotationalVelocity, kMaxRotationalAcceleration, kMaxRotationalJerk,
-                  command.O_dP_EE_c, robot_state.O_dP_EE_c, robot_state.O_ddP_EE_c);
+    command.O_dP_EE_c = limitRate(
+        robot_.rateLimits().max_translational_velocity,
+        robot_.rateLimits().max_translational_acceleration,
+        robot_.rateLimits().max_translational_jerk, robot_.rateLimits().max_rotational_velocity,
+        robot_.rateLimits().max_rotational_acceleration, robot_.rateLimits().max_rotational_jerk,
+        command.O_dP_EE_c, robot_state.O_dP_EE_c, robot_state.O_ddP_EE_c);
   }
   checkFinite(command.O_dP_EE_c);
 
@@ -319,9 +328,11 @@ void ControlLoop<CartesianVelocities>::convertMotion(
           lowpassFilter(kDeltaT, command.elbow_c[0], robot_state.elbow_c[0], cutoff_frequency_);
     }
     if (limit_rate_) {
-      command.elbow_c[0] = limitRate(kMaxElbowVelocity, kMinElbowVelocity, kMaxElbowAcceleration,
-                                     kMaxElbowJerk, command.elbow_c[0], robot_state.elbow_c[0],
-                                     robot_state.delbow_c[0], robot_state.ddelbow_c[0]);
+      command.elbow_c[0] =
+          limitRate(robot_.rateLimits().max_elbow_velocity, robot_.rateLimits().min_elbow_velocity,
+                    robot_.rateLimits().max_elbow_acceleration, robot_.rateLimits().max_elbow_jerk,
+                    command.elbow_c[0], robot_state.elbow_c[0], robot_state.delbow_c[0],
+                    robot_state.ddelbow_c[0]);
     }
     checkElbow(command.elbow_c);
   } else {

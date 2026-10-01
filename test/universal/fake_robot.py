@@ -90,10 +90,12 @@ class Robot:
         self.wrong_sizes = 0
         self.nonzero_dq = 0
         self.last_tau = None
+        self.dq_history = []
         # What the robot reports back as desired, which libfranka's rate limiting and filter
         # start from: the last command, and zero while idle.
         self.q_d = list(Q)
         self.dq_d = [0.0] * 7
+        self.ddq_d = [0.0] * 7
         self.tau_J_d = [0.0] * 7
 
 
@@ -111,7 +113,7 @@ def state_values(message_id, robot):
         F_T_EE=list(IDENTITY), EE_T_K=list(IDENTITY), F_T_NE=list(IDENTITY),
         NE_T_EE=list(IDENTITY),
         O_ddP_O=[0.0, 0.0, -9.81],  # the gravity vector, as robots report it
-        q_d=list(robot.q_d), dq_d=list(robot.dq_d), ddq_d=[0.0] * 7, tau_J_d=list(robot.tau_J_d),
+        q_d=list(robot.q_d), dq_d=list(robot.dq_d), ddq_d=list(robot.ddq_d), tau_J_d=list(robot.tau_J_d),
         m_ee=0.0, m_load=0.0, F_x_Cee=[0.0] * 3, F_x_Cload=[0.0] * 3, I_ee=[0.0] * 9,
         I_load=[0.0] * 9,
         motion_generator_mode=robot.motion_generator_mode,
@@ -156,15 +158,25 @@ def stream(address, stop, robot):
                 dq_c, finished, tau = fields[8:15], fields[40], fields[41:48]
                 robot.nonzero_dq += any(v != 0 for v in dq_c)
                 robot.last_tau = tau
+                robot.ddq_d = [(new - old) / 0.001 for new, old in zip(dq_c, robot.dq_d)]
                 robot.dq_d, robot.tau_J_d = list(dq_c), list(tau)
+                robot.dq_history.append(dq_c)
                 if finished and robot.move is not None:
                     conn, command_id = robot.move
                     robot.motion_generator_mode, robot.controller_mode = 0, 3
                     robot.move = None
+                    robot.dq_d, robot.ddq_d = [0.0] * 7, [0.0] * 7
                     reply(conn, 1, command_id, K_SUCCESS)
                     print(f"move {command_id} finished after {robot.commands} 1 kHz commands, "
                           f"{robot.wrong_sizes} of the wrong size, {robot.nonzero_dq} with nonzero"
                           f" dq_c, last tau_J_d {[round(t, 3) for t in tau]}", flush=True)
+                    history = robot.dq_history
+                    if robot.nonzero_dq and len(history) > 2:
+                        # Peak commanded joint acceleration, which the rate limiter bounds.
+                        peak = [max(abs(b[j] - a[j]) / 0.001 for a, b in zip(history, history[1:]))
+                                for j in range(7)]
+                        print(f"  peak commanded acceleration {[round(p, 3) for p in peak]} rad/s^2",
+                              flush=True)
 
 
 def handle_command(conn, command, command_id, body, robot):
@@ -177,6 +189,7 @@ def handle_command(conn, command, command_id, body, robot):
             robot.motion_generator_mode, robot.controller_mode = generator + 1, controller
             robot.move = (conn, command_id)
             robot.commands = robot.wrong_sizes = robot.nonzero_dq = 0
+            robot.dq_history = []
         print(f"  controller mode {controller}, motion generator mode {generator}", flush=True)
         reply(conn, command, command_id, K_MOTION_STARTED)
     elif name == "StopMove":

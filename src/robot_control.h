@@ -10,6 +10,8 @@
 #include <research_interface/robot/rbk_types.h>
 #include <research_interface/robot/service_types.h>
 
+#include "protocol/rate_limits.h"
+
 namespace franka {
 
 /**
@@ -101,6 +103,15 @@ class RobotControl {
    */
   virtual auto getLowerJointVelocityLimits(const std::array<double, kNumJoints>& joint_positions)
       const -> std::array<double, kNumJoints> = 0;
+
+  /**
+   * The limits the rate limiter holds motion commands to, which differ between robots.
+   *
+   * @return The connected robot's limits; the Franka Research 3's unless overridden.
+   */
+  virtual auto rateLimits() const noexcept -> const protocol::RateLimits& {
+    return protocol::kFr3RateLimits;
+  }
 };
 
 }  // namespace franka

@@ -57,6 +57,8 @@ class Robot::Impl : public RobotControl {
   auto getUpperJointVelocityLimits(
       const std::array<double, RobotControl::kNumJoints>& joint_positions) const
       -> std::array<double, RobotControl::kNumJoints> override;
+  auto rateLimits() const noexcept -> const protocol::RateLimits& override;
+
   auto getLowerJointVelocityLimits(
       const std::array<double, RobotControl::kNumJoints>& joint_positions) const
       -> std::array<double, RobotControl::kNumJoints> override;

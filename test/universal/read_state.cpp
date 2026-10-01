@@ -55,6 +55,8 @@ int main(int argc, char** argv) {
   print("elbow", state.elbow);
   print("theta", state.theta);
   print("dtheta", state.dtheta);
+  print("upper_velocity_limits", robot.getUpperJointVelocityLimits(state.q));
+  print("lower_velocity_limits", robot.getLowerJointVelocityLimits(state.q));
   print("gravity", model.gravity(state), true);
   std::cout << "}\n";
   return 0;
